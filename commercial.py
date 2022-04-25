@@ -1,14 +1,52 @@
-import asyncio
-import ujson
 import executionbackup
 from sanic import Sanic, response
 from sanic.request import Request
+from sanic.log import logger, Colors
+from ujson import loads
 from platform import python_version, system, release, machine
+import argparse
+import logging
+from os import cpu_count
+from psutil import Process
 import asyncpg
-from typing import Dict
+from Typing import *
+import asyncio
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--nodes', nargs='+', required=True, help='Nodes to load-balance across. Example: --nodes http://localhost:8545 http://localhost:8546 \nMust be at least one.')
+parser.add_argument('--port', type=int, default=8000, help='Port to run the load-balancer on.')
+parser.add_argument('--connection', type=str, required=True, help='A PostgreSQL DSN for executionbackup to connect to for client call reporting.')
+args = parser.parse_args()
 
 
 app = Sanic('router')
+logger.setLevel(logging.ERROR) # we don't want to see the sanic logs
+
+class coloredFormatter(logging.Formatter):
+
+    reset =  "\x1b[0m"
+
+    FORMATS = {
+        logging.DEBUG: '[%(asctime)s] %(levelname)s - %(message)s' + reset,
+        logging.INFO: f'[%(asctime)s] {Colors.GREEN}%(levelname)s{reset} - %(message)s',
+        logging.WARNING: f'[%(asctime)s] {Colors.YELLOW}%(levelname)s{reset} - %(message)s',
+        logging.ERROR: f'[%(asctime)s] {Colors.RED}%(levelname)s{reset} - %(message)s',
+        logging.CRITICAL: f'[%(asctime)s] {Colors.RED}%(levelname)s{reset} - %(message)s'
+    }
+
+    def format(self, record):
+        log_fmt = self.FORMATS.get(record.levelno)
+        formatter = logging.Formatter(log_fmt)
+        return formatter.format(record)
+
+logger = logging.getLogger('router')
+logger.setLevel(logging.INFO)
+ch = logging.StreamHandler()
+ch.setLevel(logging.INFO)
+ch.setFormatter(coloredFormatter())
+logger.addHandler(ch)
+
 
 Account = executionbackup.Account
     
@@ -37,7 +75,11 @@ async def dumpIntoDb():
 async def before_start(app: Sanic, loop):
     await router.setup()
     app.add_task(router.repeat_check())
-    router.db = await asyncpg.create_pool('postgresql://tennisbowling:wergh@192.168.86.37/tennisbowling')
+    router.db = None
+    try:
+        router.db = await asyncpg.create_pool('postgresql://tennisbowling:wergh@192.168.86.37/tennisbowling')
+    except Exception as e:
+        logger.critical(f'Could not connect to postgres database: {e}')
     await setAccounts()
     app.add_task(dumpIntoDb())
 
@@ -58,10 +100,10 @@ async def route(request: Request, path: str):
     try:
         if request.json['method'].startswith('engine_'):
             return response.json({'error': 'method not allowed'}, status=403)
-    except KeyError:    # fix your stupid json people
-        return response.json({'error': 'method not found'}, status=404)
+    except KeyError:
+        return response.json({'error': 'method is required'}, status=404)
 
-    await router.route(request)
+    await router.route(request, None, None)
     try:
         call = request.json['method']
     except KeyError: return
